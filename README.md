@@ -54,7 +54,7 @@ SMTP_PASSWORD = "PasswordEmailAnda"         # Password email akun Anda
 SMTP_USE_TLS = True                         # True untuk port 587, False untuk 465
 
 # File Settings
-CSV_FILE = "data/recipients.csv"            # Lokasi file data target
+CSV_FILE = ""                               # Kosongkan untuk auto-detect file CSV/Excel di folder data/
 TEMPLATE_FILE = "template.txt"              # Lokasi file template
 OUTPUT_LOG = "send_log.csv"                 # Nama file log hasil pengiriman
 

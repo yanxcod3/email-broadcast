@@ -37,9 +37,10 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "True").lower() in ("true", "1", "yes")
 
 # File Settings
-CSV_FILE = "data/recipients.csv"            # File data (CSV atau Excel) di folder data
-TEMPLATE_FILE = "template.txt"              # File template email (subjek & isi)
-OUTPUT_LOG = "send_log.csv"                 # Log pengiriman
+# Kosongkan CSV_FILE ("") untuk otomatis mendeteksi file CSV/Excel yang ada di folder data/
+CSV_FILE = os.getenv("CSV_FILE", "")            # File data spesifik atau kosongkan untuk auto-detect
+TEMPLATE_FILE = "template.txt"                  # File template email (subjek & isi)
+OUTPUT_LOG = "send_log.csv"                     # Log pengiriman
 
 # Delay (detik) antar email
 DELAY = 5
@@ -105,17 +106,67 @@ def load_template(filepath: str) -> tuple[str, str, str]:
     return sender_name, subject, body
 
 
-def load_data(filepath: str) -> list[dict]:
+def get_available_data_files() -> list[Path]:
+    """Mencari semua file CSV / Excel di folder data/."""
+    data_dir = Path("data")
+    if not data_dir.exists() or not data_dir.is_dir():
+        return []
+    valid_exts = {".csv", ".xlsx", ".xls"}
+    files = [
+        f for f in data_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in valid_exts and not f.name.startswith("~") and not f.name.startswith(".")
+    ]
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return files
+
+
+def resolve_data_file(configured_file: str = "") -> str:
+    """Deteksi file data target secara otomatis di folder data/."""
+    target = (configured_file or CSV_FILE).strip()
+    
+    # 1. Jika konfigurasi spesifik diisi dan file-nya ada
+    if target:
+        p = Path(target)
+        if p.exists() and p.is_file():
+            return str(p)
+        alt = Path("data") / target
+        if alt.exists() and alt.is_file():
+            return str(alt)
+    
+    # 2. Auto-deteksi file di dalam folder data/
+    available = get_available_data_files()
+    if not available:
+        return target or "data/recipients.csv"
+        
+    if len(available) == 1:
+        auto_file = available[0]
+        return str(auto_file)
+        
+    # Jika ada beberapa file di folder data/, tampilkan pilihan interaktif
+    print(f"\n  📁 Ditemukan {len(available)} file data di folder 'data/':")
+    for idx, f in enumerate(available, start=1):
+        print(f"     [{idx}] {f.name} ({f.stat().st_size} bytes)")
+    try:
+        choice = input(f"  Pilih file data yang ingin digunakan (1-{len(available)}) [Default 1]: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(available):
+            return str(available[int(choice) - 1])
+    except Exception:
+        pass
+    return str(available[0])
+
+
+def load_data(filepath: str = "") -> list[dict]:
     """Load data dari CSV atau Excel dengan auto-detect delimiter dan BOM."""
-    path = Path(filepath)
+    actual_path_str = resolve_data_file(filepath) if not filepath or not Path(filepath).exists() else filepath
+    path = Path(actual_path_str)
     
     # Fallback pencarian ke folder data/
     if not path.exists():
-        alt_path = Path("data") / filepath
+        alt_path = Path("data") / actual_path_str
         if alt_path.exists():
             path = alt_path
         else:
-            print(f"  ❌ ERROR: File data '{filepath}' tidak ditemukan!")
+            print(f"  ❌ ERROR: File data '{actual_path_str}' tidak ditemukan di folder data/!")
             return []
     
     if path.suffix.lower() == ".csv":
@@ -361,8 +412,9 @@ def menu_detail_template():
         return
 
     # 2. Detail Data CSV & Status Log
-    print(f"\n  File Data CSV : {CSV_FILE}")
-    data = load_data(CSV_FILE)
+    data_file = resolve_data_file(CSV_FILE)
+    print(f"\n  File Data     : {data_file}")
+    data = load_data(data_file)
     if not data:
         print("  ❌ ERROR: Data CSV kosong atau file tidak ditemukan!")
         return
@@ -404,7 +456,8 @@ def menu_send_broadcast():
         return
 
     # Load data
-    data = load_data(CSV_FILE)
+    data_file = resolve_data_file(CSV_FILE)
+    data = load_data(data_file)
     if not data:
         print("  ❌ Gagal membaca data CSV!")
         return
@@ -414,7 +467,7 @@ def menu_send_broadcast():
     pending_data = [row for row in data if get_row_email(row) not in sent_emails]
     already_sent_count = len(data) - len(pending_data)
 
-    print(f"  File Target  : {CSV_FILE} (Total: {len(data)} baris)")
+    print(f"  File Target  : {data_file} (Total: {len(data)} baris)")
     print(f"  Pengirim     : {sender_name}")
     print(f"  Subjek       : {subject_template}")
     print(f"  Delay        : {DELAY} detik / email")
