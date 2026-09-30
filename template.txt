@@ -1,0 +1,21 @@
+SENDER_NAME: Tim Informasi
+SUBJECT: Informasi Penting untuk {Nama}
+
+Halo {Nama},
+
+Semoga Anda dalam keadaan sehat dan sukses selalu.
+
+Email ini dikirimkan khusus untuk Anda terkait {Topik}. Kami ingin menginformasikan bahwa informasi terbaru untuk Anda telah diperbarui.
+
+Berikut detail informasi Anda:
+- Nama Penerima: {Nama}
+- Keterangan: {Keterangan}
+
+Jika Anda memiliki pertanyaan lebih lanjut, jangan ragu untuk membalas email ini.
+
+Terima kasih atas perhatian dan kerja sama Anda.
+
+Salam hangat,
+
+Tim Layanan & Operasional
+Website: https://example.com

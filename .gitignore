@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.env
+
+# Data & Logs (Private)
+data/*
+!data/.gitkeep
+send_log.csv
+send_log*.csv
+template_*.txt
+*.bak
+
+# Editor / IDE
+.vscode/
+.idea/
