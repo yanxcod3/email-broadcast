@@ -36,9 +36,7 @@ SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "True").lower() in ("true", "1", "yes")
 
-# File Settings
-# Kosongkan CSV_FILE ("") untuk otomatis mendeteksi file CSV/Excel yang ada di folder data/
-CSV_FILE = os.getenv("CSV_FILE", "")            # File data spesifik atau kosongkan untuk auto-detect
+# File Settings (File data otomatis dideteksi dari folder data/)
 TEMPLATE_FILE = "template.txt"                  # File template email (subjek & isi)
 OUTPUT_LOG = "send_log.csv"                     # Log pengiriman
 
@@ -122,7 +120,7 @@ def get_available_data_files() -> list[Path]:
 
 def resolve_data_file(configured_file: str = "") -> str:
     """Deteksi file data target secara otomatis di folder data/."""
-    target = (configured_file or CSV_FILE).strip()
+    target = (configured_file or os.getenv("CSV_FILE", "")).strip()
     
     # 1. Jika konfigurasi spesifik diisi dan file-nya ada
     if target:
@@ -411,8 +409,8 @@ def menu_detail_template():
         print(f"  ❌ ERROR Template: {e}")
         return
 
-    # 2. Detail Data CSV & Status Log
-    data_file = resolve_data_file(CSV_FILE)
+    # 2. Detail Data & Status Log
+    data_file = resolve_data_file()
     print(f"\n  File Data     : {data_file}")
     data = load_data(data_file)
     if not data:
@@ -455,8 +453,8 @@ def menu_send_broadcast():
         print(f"  ❌ Gagal membaca template: {e}")
         return
 
-    # Load data
-    data_file = resolve_data_file(CSV_FILE)
+    # Load data (otomatis deteksi dari folder data/)
+    data_file = resolve_data_file()
     data = load_data(data_file)
     if not data:
         print("  ❌ Gagal membaca data CSV!")
