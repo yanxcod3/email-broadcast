@@ -92,11 +92,16 @@ Tim Layanan & Operasional
 Website: https://example.com
 ```
 
-> **Catatan:**
+> **Catatan & Cara Kerja Placeholder:**
 >
-> - Header `SENDER_NAME:` mengatur nama pengirim email (dan otomatis mengisi `{sender_name}` di isi email).
-> - Header `SUBJECT:` mengatur subjek email.
-> - Baris di bawah baris kosong pertama adalah isi email (_body_). Anda juga dapat menggunakan tag HTML (seperti `<p>`, `<br>`, `<b>`) jika menginginkan format HTML.
+> - **Header Template**:
+>   - `SENDER_NAME:` mengatur nama pengirim email (dan otomatis mengisi tag `{sender_name}` di dalam isi email).
+>   - `SUBJECT:` mengatur judul/subjek email (juga mendukung placeholder seperti `{Nama}`).
+> - **Placeholder Dinamis `{Nama_Kolom}`**:
+>   - Teks di dalam tanda `{...}` bersifat dinamis dan akan otomatis digantikan dengan data pada **baris dan nama kolom CSV/Excel** yang bersangkutan (*case-insensitive*).
+>   - *Contoh*: Jika di CSV Anda ada kolom `Nama` dan `Keterangan`, gunakan `{Nama}` dan `{Keterangan}` di template. Jika ada kolom `Instansi`, Anda bisa langsung menulis `{Instansi}`.
+>   - Deteksi kolom email penerima dilakukan otomatis mencari kolom bernama `Email`, `E-mail`, `Mail`, atau `Surel`.
+> - **Format Body**: Baris setelah baris kosong pertama adalah isi email (_body_). Mendukung teks polos (*plain text*) maupun tag HTML (seperti `<p>`, `<br>`, `<b>`, `<a>`).
 
 ---
 
