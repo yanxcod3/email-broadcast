@@ -257,15 +257,30 @@ def send_email(smtp_server: smtplib.SMTP | smtplib.SMTP_SSL, from_email: str, to
     """Kirim 1 email dengan header standar RFC lengkap (Message-ID, Date, MIME) agar lolos filter spam."""
     domain = from_email.split("@")[-1] if "@" in from_email else "example.com"
     
-    # Deteksi HTML atau Plain Text
-    is_html = any(tag in body.lower() for tag in ("<html", "<p>", "<br>", "<div", "<table", "<body"))
+    # Deteksi HTML atau Plain Text (termasuk tag formatting seperti <b>, <strong>, <a>)
+    html_tags = ("<html", "<p>", "<br>", "<div", "<table", "<body", "<b", "<strong", "<a", "<ul", "<ol", "<li", "<span")
+    is_html = any(tag in body.lower() for tag in html_tags)
     
     if is_html:
         # Jika HTML, gunakan multipart/alternative dengan teks biasa sebagai fallback
         msg = MIMEMultipart("alternative")
-        plain_fallback = re.sub(r"<[^>]+>", "", body).strip()
+        
+        # Jika template berupa teks dengan tag inline (belum berstruktur <p> atau <html>),
+        # konversi baris baru menjadi <br> agar susunan paragraf tetap rapi di email client
+        html_body = body
+        if "<p" not in body.lower() and "<html" not in body.lower():
+            formatted = body.replace("\r\n", "\n").replace("\n", "<br>\n")
+            # Bersihkan <br> di sekitar tag list agar tidak menimbulkan jarak berlebih
+            formatted = re.sub(r"(</?(?:ul|ol|li)[^>]*>)\s*<br>", r"\1", formatted, flags=re.IGNORECASE)
+            formatted = re.sub(r"<br>\s*(</?(?:ul|ol|li)[^>]*>)", r"\1", formatted, flags=re.IGNORECASE)
+            html_body = f'<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.6; color: #222;">{formatted}</div>'
+            
+        plain_fallback = re.sub(r"<li[^>]*>", "• ", body, flags=re.IGNORECASE)
+        plain_fallback = re.sub(r"<br\s*/?>", "\n", plain_fallback, flags=re.IGNORECASE)
+        plain_fallback = re.sub(r"<[^>]+>", "", plain_fallback).strip()
+        plain_fallback = re.sub(r"\n{3,}", "\n\n", plain_fallback)
         msg.attach(MIMEText(plain_fallback, "plain", "utf-8"))
-        msg.attach(MIMEText(body, "html", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
     else:
         # Jika Plain Text murni, gunakan MIMEText langsung (hindari empty multipart yang ditandai spam)
         msg = MIMEText(body, "plain", "utf-8")
