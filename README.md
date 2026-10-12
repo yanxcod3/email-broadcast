@@ -13,6 +13,7 @@ Script automasi pengiriman email massal (_broadcast_) berbasis Python dan SMTP d
 - **Deteksi Limit / Kuota Server**: Mendeteksi otomatis jika server SMTP membatasi jumlah pengiriman (_rate limit / quota exceeded_) dan menawarkan opsi jeda aman.
 - **Auto-Reconnect & Fallback Port**: Otomatis menyambungkan ulang jika koneksi terputus saat jeda antar email, serta mendukung Port 587 (STARTTLS) maupun Port 465 (SSL).
 - **Mendukung CSV & Excel**: Mendukung format `.csv`, `.xlsx`, dan `.xls` dengan deteksi otomatis pemisah koma (`,`) maupun titik-koma (`;`).
+- **Sinkronisasi Bounce Otomatis (IMAP)**: Otomatis membaca inbox email pengirim pasca broadcast untuk mendeteksi email yang mental (*Mail Delivery Subsystem / Bounce*). Status email yang mental di [send_log.csv](send_log.csv) otomatis diubah dari `success` menjadi `failed: Bounced (...)`.
 - **Pencatatan Log Lengkap ([send_log.csv](send_log.csv))**: Mencatat setiap status pengiriman (_success_, _failed_, atau _skipped_) lengkap dengan nomor baris asli CSV dan waktu pengiriman.
 
 ---
