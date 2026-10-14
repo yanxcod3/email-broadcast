@@ -366,7 +366,9 @@ def get_sent_emails(log_file: str) -> set[str]:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if row.get("status", "").strip().lower() == "success":
+                st = row.get("status", "").strip().lower()
+                # Anggap terkirim jika 'success' atau sedang dalam antrean retry server ('delayed')
+                if st == "success" or st.startswith("delayed"):
                     email = row.get("email", "").strip().lower()
                     if email:
                         sent.add(email)
@@ -393,15 +395,18 @@ def is_rate_limit_error(error_msg: str) -> bool:
     return any(kw in lower for kw in keywords)
 
 
-def fetch_bounced_emails() -> dict[str, str]:
+def fetch_delivery_reports(limit: int = 100) -> dict[str, dict[str, str]]:
     """
-    Membaca INBOX via IMAP untuk mengambil daftar email yang mental (bounce) beserta alasannya.
-    Mengembalikan dict: {email_bounced: alasan_error}
+    Membaca INBOX via IMAP untuk mengambil daftar laporan pengiriman DSN:
+    - delayed: antrean sementara / greylisting / rate-limiting (SMTP 4xx / Action: delayed)
+    - failed: bounce permanen (SMTP 5xx / Action: failed)
+    
+    Mengembalikan dict: {email: {"type": "delayed"|"failed", "reason": alasan_error}}
     """
     imap_host = os.getenv("IMAP_HOST") or SMTP_HOST
     imap_port = int(os.getenv("IMAP_PORT") or 993)
     
-    bounces: dict[str, str] = {}
+    reports: dict[str, dict[str, str]] = {}
     try:
         mail = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=15)
         mail.login(SMTP_EMAIL, SMTP_PASSWORD)
@@ -413,11 +418,11 @@ def fetch_bounced_emails() -> dict[str, str]:
                 mail.logout()
             except Exception:
                 pass
-            return bounces
+            return reports
             
         msg_ids = data[0].split()
-        # Ambil maksimal 50 pesan terakhir untuk efisiensi
-        target_ids = msg_ids[-50:] if len(msg_ids) > 50 else msg_ids
+        # Ambil maksimal pesan terakhir sesuai limit untuk efisiensi
+        target_ids = msg_ids[-limit:] if len(msg_ids) > limit else msg_ids
         
         for mid in target_ids:
             try:
@@ -430,11 +435,13 @@ def fetch_bounced_emails() -> dict[str, str]:
                 sender = str(msg.get("From", "")).lower()
                 subject = str(msg.get("Subject", "")).lower()
                 
-                # Filter apakah email ini merupakan laporan bounce / NDR
-                is_bounce = any(kw in sender for kw in ("mailer-daemon", "mail delivery", "postmaster")) or \
-                            any(kw in subject for kw in ("delivery failed", "failure", "undelivered", "returned to sender"))
+                # Filter apakah email ini merupakan laporan bounce / DSN / delay warning
+                is_report = (
+                    any(kw in sender for kw in ("mailer-daemon", "mail delivery", "postmaster")) or
+                    any(kw in subject for kw in ("delivery failed", "failure", "undelivered", "returned to sender", "delayed", "warning"))
+                )
                 
-                if not is_bounce:
+                if not is_report:
                     continue
                 
                 content = ""
@@ -448,9 +455,11 @@ def fetch_bounced_emails() -> dict[str, str]:
                         except Exception:
                             pass
                 
-                # Ekstrak alamat email yang mental
+                # Ekstrak alamat email penerima
                 # Pola 1: Exim / cPanel ("The following address(es) failed:\n  email@domain")
-                m = re.search(r"The following address\(es\) failed:\s*\n\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)", content, re.IGNORECASE)
+                m = re.search(r"The following address\(es\)\s+(?:failed|have not yet been delivered):\s*\n\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)", content, re.IGNORECASE)
+                if not m:
+                    m = re.search(r"The address to which the message has not yet been delivered is:\s*\n\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)", content, re.IGNORECASE)
                 # Pola 2: RFC 3464 ("Final-Recipient: rfc822; email@domain")
                 if not m:
                     m = re.search(r"Final-Recipient:\s*(?:rfc822;\s*)?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)", content, re.IGNORECASE)
@@ -459,17 +468,42 @@ def fetch_bounced_emails() -> dict[str, str]:
                     m = re.search(r"RCPT TO:<([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)>", content, re.IGNORECASE)
                     
                 if m:
-                    bounced_email = m.group(1).strip().lower()
+                    target_email = m.group(1).strip().lower()
                     
-                    # Ekstrak alasan error / status code (misal 550 ...)
-                    err_m = re.search(r"(?:SMTP error[^\n]*:\s*\n\s*|Diagnostic-Code:[^\n]*\n?\s*)([0-9]{3}[^\n]+)", content, re.IGNORECASE)
+                    # Deteksi Action header (RFC 3464)
+                    action_m = re.search(r"Action:\s*([a-zA-Z]+)", content, re.IGNORECASE)
+                    action_val = action_m.group(1).lower() if action_m else ""
+                    
+                    # Deteksi status code RFC 3464 (Status: 4.x.x / 5.x.x)
+                    status_m = re.search(r"Status:\s*([0-9]+\.[0-9]+\.[0-9]+)", content, re.IGNORECASE)
+                    status_code = status_m.group(1) if status_m else ""
+                    
+                    # Ekstrak alasan error / diagnostic code (misal 450 ... atau 550 ...)
+                    err_m = re.search(r"(?:SMTP error[^\n]*:\s*\n\s*|Diagnostic-Code:[^\n]*\n?\s*|Delay reason:[^\n]*\n?\s*)([0-9]{3}[^\n]+)", content, re.IGNORECASE)
                     if err_m:
                         err_reason = err_m.group(1).strip()
                     else:
-                        err_reason = "550 Mailbox unavailable / Recipient not found"
-                        
-                    # Simpan error terbaru jika ada beberapa laporan
-                    bounces[bounced_email] = err_reason
+                        delay_m = re.search(r"Delay reason:\s*(.+)", content, re.IGNORECASE)
+                        if delay_m:
+                            err_reason = delay_m.group(1).strip()
+                        elif action_val == "delayed" or status_code.startswith("4"):
+                            err_reason = "450 Delivery delayed temporarily by remote server"
+                        else:
+                            err_reason = "550 Mailbox unavailable / Recipient not found"
+                    
+                    # Tentukan apakah delayed atau failed permanen
+                    is_delayed = (
+                        action_val == "delayed" or
+                        status_code.startswith("4") or
+                        "delayed" in subject or
+                        re.match(r"^4\d{2}\b", err_reason) is not None
+                    )
+                    
+                    rep_type = "delayed" if is_delayed else "failed"
+                    reports[target_email] = {
+                        "type": rep_type,
+                        "reason": err_reason
+                    }
             except Exception:
                 continue
                 
@@ -478,35 +512,43 @@ def fetch_bounced_emails() -> dict[str, str]:
         except Exception:
             pass
     except Exception as e:
-        print(f"    ⚠️ Gagal memeriksa IMAP bounce: {e}")
+        print(f"    ⚠️ Gagal memeriksa IMAP bounce / delay: {e}")
         
-    return bounces
+    return reports
 
 
-def sync_bounces(log_file: str, wait_seconds: int = 0) -> int:
+def fetch_bounced_emails() -> dict[str, str]:
+    """Compatibility wrapper: mengembalikan dict bounce permanen saja."""
+    reports = fetch_delivery_reports()
+    return {email: r["reason"] for email, r in reports.items() if r["type"] == "failed"}
+
+
+def sync_bounces(log_file: str, wait_seconds: int = 0, limit: int = 100) -> tuple[int, int]:
     """
-    Periksa INBOX via IMAP dan otomatis sinkronkan status bounce ke log_file.
-    Mengubah status 'success' menjadi 'failed: Bounced (...)' jika email mental.
-    Mengembalikan jumlah baris yang berhasil diupdate.
+    Periksa INBOX via IMAP dan otomatis sinkronkan status bounce & delay ke log_file.
+    - Status 'success' diubah menjadi 'delayed: (...)' jika remote server menunda pengiriman (4xx).
+    - Status 'success' atau 'delayed' diubah menjadi 'failed: Bounced (...)' jika email mental permanen (5xx).
+    Mengembalikan tuple: (bounced_count, delayed_count)
     """
     if wait_seconds > 0:
-        print(f"\n  ⏳ Menunggu {wait_seconds} detik agar server menyelesaikan laporan bounce...")
+        print(f"\n  ⏳ Menunggu {wait_seconds} detik agar server menyelesaikan laporan bounce/delay...")
         for rem in range(wait_seconds, 0, -1):
             print(f"     Sisa waktu tunggu: {rem} detik...  ", end="\r")
             time.sleep(1)
         print(" " * 45, end="\r")
         
-    print("  🔍 Memeriksa laporan bounce di inbox pengirim via IMAP...")
-    bounces = fetch_bounced_emails()
-    if not bounces:
-        print("  ✅ Tidak ditemukan email bounce baru di inbox.")
-        return 0
+    print("  🔍 Memeriksa laporan pengiriman (bounce & delayed) di inbox pengirim via IMAP...")
+    reports = fetch_delivery_reports(limit=limit)
+    if not reports:
+        print("  ✅ Tidak ditemukan laporan bounce atau delay baru di inbox.")
+        return 0, 0
         
     path = Path(log_file)
     if not path.exists():
-        return 0
+        return 0, 0
         
-    updated_count = 0
+    updated_bounces = 0
+    updated_delays = 0
     rows = []
     
     with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
@@ -518,24 +560,44 @@ def sync_bounces(log_file: str, wait_seconds: int = 0) -> int:
             email_val = row[1].strip().lower()
             status_val = row[2].strip().lower()
             
-            # Jika sebelumnya tercatat 'success' tapi sebenarnya bounce
-            if email_val in bounces and status_val == "success":
-                reason = bounces[email_val]
-                row[2] = f"failed: Bounced ({reason})"
-                updated_count += 1
-                print(f"     ⚠️ TERDETEKSI BOUNCE: {email_val}")
-                print(f"        Alasan: {reason}")
+            if email_val in reports:
+                rep = reports[email_val]
+                rep_type = rep["type"]
+                reason = rep["reason"]
+                
+                # Kasus 1: Email sukses tapi ternyata tertunda (delayed / greylisting 4xx)
+                if rep_type == "delayed" and status_val == "success":
+                    row[2] = f"delayed: {reason}"
+                    updated_delays += 1
+                    print(f"     ⏳ TERDETEKSI DELAYED (ANTREAN): {email_val}")
+                    print(f"        Alasan: {reason}")
+                    
+                # Kasus 2: Email sukses atau delayed tapi ternyata mental permanen (bounce 5xx)
+                elif rep_type == "failed" and (status_val == "success" or status_val.startswith("delayed")):
+                    row[2] = f"failed: Bounced ({reason})"
+                    updated_bounces += 1
+                    print(f"     ⚠️ TERDETEKSI BOUNCE (GAGAL): {email_val}")
+                    print(f"        Alasan: {reason}")
+                    
+                # Kasus 3: Jika sebelumnya sempat salah tercatat 'failed' dengan kode 4xx, koreksi ke 'delayed'
+                elif rep_type == "delayed" and status_val.startswith("failed: bounced (4"):
+                    row[2] = f"delayed: {reason}"
+                    updated_delays += 1
+                    print(f"     🔄 KOREKSI DARI FAILED KE DELAYED: {email_val}")
+                    print(f"        Alasan: {reason}")
+                    
             rows.append(row)
             
-    if updated_count > 0:
+    total_updated = updated_bounces + updated_delays
+    if total_updated > 0:
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerows(rows)
-        print(f"  ✅ Log diperbarui: {updated_count} email yang mental diubah dari 'success' ke 'failed'.")
+        print(f"  ✅ Log diperbarui: {updated_delays} delayed (antrean sementara), {updated_bounces} failed (mental permanen).")
     else:
-        print("  ℹ️  Tidak ada email sukses yang perlu diperbarui (semua bounce sudah tercatat).")
+        print("  ℹ️  Tidak ada perubahan status (semua laporan sudah tersinkronisasi di log).")
         
-    return updated_count
+    return updated_bounces, updated_delays
 
 
 # ============================================================
@@ -543,21 +605,36 @@ def sync_bounces(log_file: str, wait_seconds: int = 0) -> int:
 # ============================================================
 
 def menu_check_connection():
-    """Menu 1: Cek Koneksi SMTP."""
+    """Menu 1: Cek Koneksi SMTP & IMAP."""
     protocol = "SSL" if (SMTP_PORT == 465 or not SMTP_USE_TLS) else "STARTTLS"
     print("\n" + "=" * 60)
-    print("  [1] CEK KONEKSI SMTP")
+    print("  [1] CEK KONEKSI SMTP & IMAP")
     print("=" * 60)
-    print(f"  Host      : {SMTP_HOST}:{SMTP_PORT} ({protocol})")
+    print(f"  Host SMTP : {SMTP_HOST}:{SMTP_PORT} ({protocol})")
     print(f"  Akun      : {SMTP_EMAIL}")
-    print("  Status    : Menghubungkan dan memverifikasi autentikasi...")
+    print("  Status    : Menghubungkan dan memverifikasi autentikasi SMTP...")
     
     try:
         server = init_smtp()
-        print("  Hasil     : ✅ Koneksi & Autentikasi Berhasil!")
+        print("  Hasil SMTP: ✅ Koneksi & Autentikasi SMTP Berhasil!")
         server.quit()
     except Exception as e:
-        print("  Hasil     : ❌ Gagal terhubung!")
+        print("  Hasil SMTP: ❌ Gagal terhubung ke SMTP!")
+        print(f"  Detail    : {e}")
+
+    # Cek IMAP
+    imap_host = os.getenv("IMAP_HOST") or SMTP_HOST
+    imap_port = int(os.getenv("IMAP_PORT") or 993)
+    print(f"\n  Host IMAP : {imap_host}:{imap_port} (SSL)")
+    print("  Status    : Menghubungkan ke server IMAP (Inbox)...")
+    try:
+        mail = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=12)
+        mail.login(SMTP_EMAIL, SMTP_PASSWORD)
+        mail.select("INBOX", readonly=True)
+        print("  Hasil IMAP: ✅ Koneksi IMAP Berhasil (Siap baca Bounce & Delay)!")
+        mail.logout()
+    except Exception as e:
+        print("  Hasil IMAP: ⚠️ Gagal terhubung ke IMAP!")
         print(f"  Detail    : {e}")
 
 
@@ -776,15 +853,17 @@ def menu_send_broadcast():
         except Exception:
             pass
     
-    # Auto-sinkronisasi bounce setelah pengiriman selesai
+    # Auto-sinkronisasi bounce & delayed setelah pengiriman selesai
+    delayed_total = 0
     if success_count > 0:
         print("\n" + "-" * 60)
-        print("  SINKRONISASI BOUNCE OTOMATIS (IMAP)")
+        print("  SINKRONISASI STATUS PENGIRIMAN (IMAP)")
         print("-" * 60)
-        bounced_count = sync_bounces(OUTPUT_LOG, wait_seconds=8)
-        if bounced_count > 0:
-            success_count -= bounced_count
+        bounced_count, delayed_count = sync_bounces(OUTPUT_LOG, wait_seconds=8)
+        if bounced_count > 0 or delayed_count > 0:
+            success_count -= (bounced_count + delayed_count)
             fail_count += bounced_count
+            delayed_total += delayed_count
     
     # Summary
     print("=" * 60)
@@ -792,8 +871,59 @@ def menu_send_broadcast():
     print("=" * 60)
     print(f"  Diproses sesi ini : {len(target_queue)}")
     print(f"  ✅ Benar Terkirim : {success_count}")
+    if delayed_total > 0:
+        print(f"  ⏳ Antrean Tertunda: {delayed_total} (server remote menunda via greylisting/delay)")
     print(f"  ❌ Gagal / Mental : {fail_count}")
     print(f"  📁 File Log       : {OUTPUT_LOG}")
+    print("=" * 60)
+
+
+def menu_sync_status():
+    """Menu 4: Sinkronisasi Status Pengiriman (Bounce & Delayed via IMAP)."""
+    print("\n" + "=" * 60)
+    print("  [4] SINKRONISASI STATUS PENGIRIMAN (IMAP)")
+    print("=" * 60)
+    
+    path = Path(OUTPUT_LOG)
+    if not path.exists() or path.stat().st_size == 0:
+        print(f"  ⚠️ File log '{OUTPUT_LOG}' belum ada atau masih kosong.")
+        print("     Silakan lakukan pengiriman email terlebih dahulu.")
+        return
+        
+    print(f"  File Log   : {OUTPUT_LOG}")
+    print("  Membaca laporan bounce & delay dari inbox email pengirim via IMAP...")
+    
+    bounced_count, delayed_count = sync_bounces(OUTPUT_LOG, wait_seconds=0, limit=100)
+    
+    # Hitung rekap status terbaru dari file send_log.csv
+    total_entries = 0
+    success_count = 0
+    delayed_total = 0
+    failed_count = 0
+    
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                st = row.get("status", "").strip().lower()
+                total_entries += 1
+                if st == "success":
+                    success_count += 1
+                elif st.startswith("delayed"):
+                    delayed_total += 1
+                elif "fail" in st or "bounce" in st or "skip" in st:
+                    failed_count += 1
+    except Exception:
+        pass
+        
+    print("\n" + "-" * 60)
+    print("  REKAP STATUS FILE LOG TERKINI")
+    print("-" * 60)
+    print(f"  Total Data di Log  : {total_entries} baris")
+    print(f"  ✅ Sukses          : {success_count}")
+    print(f"  ⏳ Delayed (Antre) : {delayed_total}")
+    print(f"  ❌ Gagal / Bounce  : {failed_count}")
+    print(f"  📁 File Log        : {OUTPUT_LOG}")
     print("=" * 60)
 
 
@@ -807,14 +937,15 @@ def main():
         print("           EMAIL BROADCAST SYSTEM — SMTP")
         print("=" * 60)
         print("PILIHAN MENU:")
-        print("  [1] Cek Koneksi SMTP")
+        print("  [1] Cek Koneksi SMTP & IMAP")
         print("  [2] Detail Template & Data Target")
         print("  [3] Send Broadcast")
+        print("  [4] Sinkronisasi Status Pengiriman (IMAP)")
         print("  [0] Keluar")
         print("=" * 60)
         
         try:
-            pilihan = input("Pilih menu (0-3): ").strip()
+            pilihan = input("Pilih menu (0-4): ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nProgram dihentikan.")
             break
@@ -825,11 +956,13 @@ def main():
             menu_detail_template()
         elif pilihan == "3":
             menu_send_broadcast()
+        elif pilihan == "4":
+            menu_sync_status()
         elif pilihan in ("0", "exit", "q"):
             print("\nTerima kasih. Program selesai.")
             break
         else:
-            print("\n⚠️ Pilihan tidak valid! Masukkan angka 0 - 3.")
+            print("\n⚠️ Pilihan tidak valid! Masukkan angka 0 - 4.")
 
 
 if __name__ == "__main__":

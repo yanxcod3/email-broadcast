@@ -120,17 +120,18 @@ Terminal akan menampilkan menu interaktif:
            EMAIL BROADCAST SYSTEM — SMTP
 ============================================================
 PILIHAN MENU:
-  [1] Cek Koneksi SMTP
+  [1] Cek Koneksi SMTP & IMAP
   [2] Detail Template & Data Target
   [3] Send Broadcast
+  [4] Sinkronisasi Status Pengiriman (IMAP)
   [0] Keluar
 ============================================================
-Pilih menu (0-3):
+Pilih menu (0-4):
 ```
 
-### 1. `[1] Cek Koneksi SMTP`
+### 1. `[1] Cek Koneksi SMTP & IMAP`
 
-Menguji konektivitas dan autentikasi username & password ke server SMTP tanpa mengirimkan email. Sangat berguna untuk memastikan konfigurasi sudah benar sebelum mulai _broadcast_.
+Menguji konektivitas dan autentikasi akun ke server SMTP (kirim email) serta IMAP (inbox baca bounce/delay) tanpa mengirimkan email.
 
 ### 2. `[2] Detail Template & Data Target`
 
@@ -144,6 +145,14 @@ Memulai proses pengiriman:
 - Jika ditemukan riwayat di `send_log.csv`, sistem akan memberi pilihan untuk **hanya melanjutkan sisa antrean yang belum terkirim** atau mengulang dari awal.
 - Mengirim email satu per satu sesuai jeda waktu `DELAY`.
 - Jika terdeteksi _limit/quota_ dari server, script otomatis menjeda proses dan memberi opsi untuk menunggu atau menghentikan secara aman.
+- Di akhir pengiriman, sistem otomatis melakukan verifikasi IMAP untuk mengecek status _bounce_ atau _delayed_.
+
+### 4. `[4] Sinkronisasi Status Pengiriman (IMAP)`
+
+Memeriksa inbox email pengirim kapan saja secara manual tanpa harus mengirim email:
+- Mendeteksi laporan email **mental permanen (_hard bounce 5xx_)** ➔ memperbarui status log menjadi `failed: Bounced (...)`.
+- Mendeteksi peringatan **antrean tunda (_greylisting / delayed 4xx_)** ➔ memperbarui status log menjadi `delayed: (...)`.
+- Menampilkan rekapitulasi jumlah total email sukses, antre (delayed), dan gagal di `send_log.csv`.
 
 ---
 
@@ -154,8 +163,8 @@ Setiap email yang diproses akan dicatat secara _real-time_ ke file **[send_log.c
 | row | email                     |             status              | subject                                         |      timestamp      |
 | :-: | :------------------------ | :-----------------------------: | :---------------------------------------------- | :-----------------: |
 |  2  | alex@example.com          |             success             | Informasi Penting untuk Alex                    | 2026-09-28 15:10:05 |
-|  3  | budi@example.com          |             success             | Informasi Penting untuk Budi                    | 2026-09-28 15:10:10 |
-|  4  | user.invalid@example.com  | failed: (550, 'User not found') | Informasi Penting untuk Citra                   | 2026-09-28 15:10:15 |
+|  3  | budi@example.com          | delayed: (450 4.7.1 Greylisted) | Informasi Penting untuk Budi                    | 2026-09-28 15:10:10 |
+|  4  | user.invalid@example.com  | failed: Bounced (550 User not found) | Informasi Penting untuk Citra              | 2026-09-28 15:10:15 |
 
 ---
 
