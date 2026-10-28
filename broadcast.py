@@ -17,10 +17,11 @@ import ssl
 import sys
 import time
 import random
+from datetime import datetime, timedelta
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formataddr, formatdate, make_msgid
+from email.utils import formataddr, formatdate, make_msgid, parsedate_to_datetime
 from pathlib import Path
 
 # Pastikan konsol Windows mendukung UTF-8 (emoji)
@@ -355,26 +356,39 @@ def log_result(log_file: str, row_num: int, email: str, status: str, subject: st
         writer.writerow([row_num, email, status, subject, time.strftime("%Y-%m-%d %H:%M:%S")])
 
 
+def parse_log_timestamp(ts_str: str) -> datetime | None:
+    """Konversi string timestamp log (YYYY-MM-DD HH:MM:SS) ke timezone-aware datetime lokal."""
+    if not ts_str:
+        return None
+    try:
+        dt = datetime.strptime(ts_str.strip(), "%Y-%m-%d %H:%M:%S")
+        return dt.astimezone()
+    except Exception:
+        return None
+
+
 def get_sent_emails(log_file: str) -> set[str]:
-    """Membaca log pengiriman untuk mendeteksi email yang sudah sukses terkirim."""
+    """Membaca log pengiriman untuk mendeteksi email yang status TERAKHIRNYA sudah sukses terkirim."""
     path = Path(log_file)
     if not path.exists() or path.stat().st_size == 0:
         return set()
     
-    sent = set()
+    latest_status: dict[str, str] = {}
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             reader = csv.DictReader(f)
             for row in reader:
+                email_val = row.get("email", "").strip().lower()
                 st = row.get("status", "").strip().lower()
-                # Anggap terkirim jika 'success' atau sedang dalam antrean retry server ('delayed')
-                if st == "success" or st.startswith("delayed"):
-                    email = row.get("email", "").strip().lower()
-                    if email:
-                        sent.add(email)
+                if email_val:
+                    latest_status[email_val] = st
     except Exception:
         pass
-    return sent
+        
+    return {
+        email_val for email_val, st in latest_status.items()
+        if st == "success" or st.startswith("delayed")
+    }
 
 
 def get_row_email(row: dict) -> str:
@@ -395,18 +409,19 @@ def is_rate_limit_error(error_msg: str) -> bool:
     return any(kw in lower for kw in keywords)
 
 
-def fetch_delivery_reports(limit: int = 100) -> dict[str, dict[str, str]]:
+def fetch_delivery_reports(limit: int = 100, since_time: datetime | None = None) -> dict[str, list[dict]]:
     """
     Membaca INBOX via IMAP untuk mengambil daftar laporan pengiriman DSN:
     - delayed: antrean sementara / greylisting / rate-limiting (SMTP 4xx / Action: delayed)
     - failed: bounce permanen (SMTP 5xx / Action: failed)
     
-    Mengembalikan dict: {email: {"type": "delayed"|"failed", "reason": alasan_error}}
+    Mengembalikan dict: {email: [{"type": "delayed"|"failed", "reason": str, "date": datetime}]}
+    Jika since_time diberikan, hanya laporan yang bertanggal >= since_time yang diproses.
     """
     imap_host = os.getenv("IMAP_HOST") or SMTP_HOST
     imap_port = int(os.getenv("IMAP_PORT") or 993)
     
-    reports: dict[str, dict[str, str]] = {}
+    reports: dict[str, list[dict]] = {}
     try:
         mail = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=15)
         mail.login(SMTP_EMAIL, SMTP_PASSWORD)
@@ -426,7 +441,7 @@ def fetch_delivery_reports(limit: int = 100) -> dict[str, dict[str, str]]:
         
         for mid in target_ids:
             try:
-                res, msg_data = mail.fetch(mid, "(RFC822)")
+                res, msg_data = mail.fetch(mid, "(RFC822 INTERNALDATE)")
                 if res != "OK" or not msg_data or not msg_data[0]:
                     continue
                 raw_bytes = msg_data[0][1]
@@ -438,10 +453,33 @@ def fetch_delivery_reports(limit: int = 100) -> dict[str, dict[str, str]]:
                 # Filter apakah email ini merupakan laporan bounce / DSN / delay warning
                 is_report = (
                     any(kw in sender for kw in ("mailer-daemon", "mail delivery", "postmaster")) or
-                    any(kw in subject for kw in ("delivery failed", "failure", "undelivered", "returned to sender", "delayed", "warning"))
+                    any(kw in subject for kw in (
+                        "delivery failed", "failure notice", "undelivered", "returned to sender", 
+                        "delayed", "warning", "delivery status", "undeliverable"
+                    ))
                 )
                 
                 if not is_report:
+                    continue
+                
+                # Ekstrak tanggal pesan bounce/laporan DSN
+                report_dt = None
+                date_header = msg.get("Date")
+                if date_header:
+                    try:
+                        report_dt = parsedate_to_datetime(date_header).astimezone()
+                    except Exception:
+                        pass
+                if report_dt is None and len(msg_data[0]) > 0:
+                    try:
+                        m_idate = re.search(r'INTERNALDATE "([^"]+)"', str(msg_data[0][0]))
+                        if m_idate:
+                            report_dt = parsedate_to_datetime(m_idate.group(1)).astimezone()
+                    except Exception:
+                        pass
+                
+                # Jika ada batasan since_time dan tanggal pesan lebih lama dari since_time, abaikan
+                if since_time and report_dt and report_dt < since_time:
                     continue
                 
                 content = ""
@@ -456,20 +494,32 @@ def fetch_delivery_reports(limit: int = 100) -> dict[str, dict[str, str]]:
                             pass
                 
                 # Ekstrak alamat email penerima
+                target_email = ""
+                failed_recipients = msg.get("X-Failed-Recipients")
+                if failed_recipients:
+                    target_email = failed_recipients.strip().split(",")[0].strip().lower()
+                
                 # Pola 1: Exim / cPanel ("The following address(es) failed:\n  email@domain")
-                m = re.search(r"The following address\(es\)\s+(?:failed|have not yet been delivered):\s*\n\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)", content, re.IGNORECASE)
-                if not m:
+                if not target_email:
+                    m = re.search(r"The following address\(es\)\s+(?:failed|have not yet been delivered):\s*\n\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)", content, re.IGNORECASE)
+                    if m:
+                        target_email = m.group(1).strip().lower()
+                if not target_email:
                     m = re.search(r"The address to which the message has not yet been delivered is:\s*\n\s*([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)", content, re.IGNORECASE)
+                    if m:
+                        target_email = m.group(1).strip().lower()
                 # Pola 2: RFC 3464 ("Final-Recipient: rfc822; email@domain")
-                if not m:
+                if not target_email:
                     m = re.search(r"Final-Recipient:\s*(?:rfc822;\s*)?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)", content, re.IGNORECASE)
+                    if m:
+                        target_email = m.group(1).strip().lower()
                 # Pola 3: SMTP RCPT TO ("RCPT TO:<email@domain>")
-                if not m:
+                if not target_email:
                     m = re.search(r"RCPT TO:<([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+)>", content, re.IGNORECASE)
-                    
-                if m:
-                    target_email = m.group(1).strip().lower()
-                    
+                    if m:
+                        target_email = m.group(1).strip().lower()
+                        
+                if target_email:
                     # Deteksi Action header (RFC 3464)
                     action_m = re.search(r"Action:\s*([a-zA-Z]+)", content, re.IGNORECASE)
                     action_val = action_m.group(1).lower() if action_m else ""
@@ -500,10 +550,13 @@ def fetch_delivery_reports(limit: int = 100) -> dict[str, dict[str, str]]:
                     )
                     
                     rep_type = "delayed" if is_delayed else "failed"
-                    reports[target_email] = {
+                    if target_email not in reports:
+                        reports[target_email] = []
+                    reports[target_email].append({
                         "type": rep_type,
-                        "reason": err_reason
-                    }
+                        "reason": err_reason,
+                        "date": report_dt,
+                    })
             except Exception:
                 continue
                 
@@ -520,14 +573,29 @@ def fetch_delivery_reports(limit: int = 100) -> dict[str, dict[str, str]]:
 def fetch_bounced_emails() -> dict[str, str]:
     """Compatibility wrapper: mengembalikan dict bounce permanen saja."""
     reports = fetch_delivery_reports()
-    return {email: r["reason"] for email, r in reports.items() if r["type"] == "failed"}
+    result = {}
+    for email_addr, rep_list in reports.items():
+        failed_reps = [r for r in rep_list if r["type"] == "failed"]
+        if failed_reps:
+            result[email_addr] = failed_reps[-1]["reason"]
+    return result
 
 
-def sync_bounces(log_file: str, wait_seconds: int = 0, limit: int = 100) -> tuple[int, int]:
+def sync_bounces(
+    log_file: str, 
+    wait_seconds: int = 0, 
+    limit: int = 100,
+    since_time: datetime | None = None,
+    target_emails: set[str] | None = None
+) -> tuple[int, int]:
     """
     Periksa INBOX via IMAP dan otomatis sinkronkan status bounce & delay ke log_file.
     - Status 'success' diubah menjadi 'delayed: (...)' jika remote server menunda pengiriman (4xx).
     - Status 'success' atau 'delayed' diubah menjadi 'failed: Bounced (...)' jika email mental permanen (5xx).
+    
+    Hanya laporan bounce yang terjadi SETELAH email terkait dikirim yang akan diterapkan,
+    sehingga bounce dari pengiriman lama/kemarin tidak akan membuat pengiriman baru hari ini gagal.
+    
     Mengembalikan tuple: (bounced_count, delayed_count)
     """
     if wait_seconds > 0:
@@ -538,7 +606,8 @@ def sync_bounces(log_file: str, wait_seconds: int = 0, limit: int = 100) -> tupl
         print(" " * 45, end="\r")
         
     print("  🔍 Memeriksa laporan pengiriman (bounce & delayed) di inbox pengirim via IMAP...")
-    reports = fetch_delivery_reports(limit=limit)
+    effective_since = (since_time - timedelta(seconds=60)) if since_time else None
+    reports = fetch_delivery_reports(limit=limit, since_time=effective_since)
     if not reports:
         print("  ✅ Tidak ditemukan laporan bounce atau delay baru di inbox.")
         return 0, 0
@@ -549,19 +618,73 @@ def sync_bounces(log_file: str, wait_seconds: int = 0, limit: int = 100) -> tupl
         
     updated_bounces = 0
     updated_delays = 0
-    rows = []
     
-    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-        reader = csv.reader(f)
-        for i, row in enumerate(reader):
-            if i == 0 or len(row) < 3:
-                rows.append(row)
-                continue
-            email_val = row[1].strip().lower()
-            status_val = row[2].strip().lower()
+    with open(path, "r", newline="", encoding="utf-8-sig", errors="replace") as f:
+        reader = [r for r in csv.reader(f) if any(cell.strip() for cell in r)]
+        
+    if not reader:
+        return 0, 0
+
+    header = reader[0]
+    data_rows = reader[1:]
+    
+    # Buat peta timeline pengiriman per email: email -> list of (row_index, send_dt)
+    email_timeline: dict[str, list[tuple[int, datetime]]] = {}
+    for idx, r in enumerate(data_rows):
+        if len(r) >= 2:
+            em = r[1].strip().lower()
+            ts = r[4].strip() if len(r) > 4 else ""
+            dt = parse_log_timestamp(ts)
+            if em and dt:
+                if em not in email_timeline:
+                    email_timeline[em] = []
+                email_timeline[em].append((idx, dt))
+                
+    for idx, row in enumerate(data_rows):
+        if len(row) < 3:
+            continue
             
-            if email_val in reports:
-                rep = reports[email_val]
+        email_val = row[1].strip().lower()
+        status_val = row[2].strip().lower()
+        ts_str = row[4].strip() if len(row) > 4 else ""
+        row_send_dt = parse_log_timestamp(ts_str)
+        
+        # Filter jika target_emails ditentukan (misal sesi pengiriman saat ini)
+        if target_emails is not None and email_val not in target_emails:
+            continue
+            
+        # Filter jika since_time ditentukan
+        if since_time and row_send_dt and row_send_dt < (since_time - timedelta(seconds=60)):
+            continue
+            
+        if email_val in reports:
+            # Tentukan batas waktu berikutnya jika email ini dikirim ulang nanti
+            next_send_dt = None
+            if email_val in email_timeline:
+                entries = email_timeline[email_val]
+                for pos, (e_idx, e_dt) in enumerate(entries):
+                    if e_idx == idx:
+                        if pos + 1 < len(entries):
+                            next_send_dt = entries[pos + 1][1]
+                        break
+                        
+            # Cari laporan bounce yang valid untuk pengiriman spesifik ini
+            valid_reps = []
+            for rep in reports[email_val]:
+                rep_date = rep.get("date")
+                if rep_date is None or row_send_dt is None:
+                    if not since_time:
+                        valid_reps.append(rep)
+                else:
+                    # Bounce harus terjadi setelah pengiriman ini (toleransi 60 detik)
+                    after_send = rep_date >= (row_send_dt - timedelta(seconds=60))
+                    # Dan sebelum pengiriman berikutnya dari email yang sama (jika ada)
+                    before_next = (next_send_dt is None) or (rep_date < (next_send_dt - timedelta(seconds=60)))
+                    if after_send and before_next:
+                        valid_reps.append(rep)
+                        
+            if valid_reps:
+                rep = valid_reps[-1]
                 rep_type = rep["type"]
                 reason = rep["reason"]
                 
@@ -586,13 +709,12 @@ def sync_bounces(log_file: str, wait_seconds: int = 0, limit: int = 100) -> tupl
                     print(f"     🔄 KOREKSI DARI FAILED KE DELAYED: {email_val}")
                     print(f"        Alasan: {reason}")
                     
-            rows.append(row)
-            
     total_updated = updated_bounces + updated_delays
     if total_updated > 0:
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerows(rows)
+            writer.writerow(header)
+            writer.writerows(data_rows)
         print(f"  ✅ Log diperbarui: {updated_delays} delayed (antrean sementara), {updated_bounces} failed (mental permanen).")
     else:
         print("  ℹ️  Tidak ada perubahan status (semua laporan sudah tersinkronisasi di log).")
@@ -771,6 +893,8 @@ def menu_send_broadcast():
         return
 
     print("-" * 60)
+    session_start_time = datetime.now().astimezone()
+    session_emails: set[str] = set()
     success_count = 0
     fail_count = 0
     
@@ -788,6 +912,7 @@ def menu_send_broadcast():
                 log_result(OUTPUT_LOG, row_num, "", "skipped (empty email)", subject)
                 continue
             
+            session_emails.add(to_email.strip().lower())
             print(f"  [{i}/{len(target_queue)}] (Baris CSV #{row_num}) Mengirim ke : {recipient_display}")
             print(f"        Subjek      : {subject}")
             
@@ -859,7 +984,12 @@ def menu_send_broadcast():
         print("\n" + "-" * 60)
         print("  SINKRONISASI STATUS PENGIRIMAN (IMAP)")
         print("-" * 60)
-        bounced_count, delayed_count = sync_bounces(OUTPUT_LOG, wait_seconds=8)
+        bounced_count, delayed_count = sync_bounces(
+            OUTPUT_LOG, 
+            wait_seconds=8, 
+            since_time=session_start_time, 
+            target_emails=session_emails
+        )
         if bounced_count > 0 or delayed_count > 0:
             success_count -= (bounced_count + delayed_count)
             fail_count += bounced_count
